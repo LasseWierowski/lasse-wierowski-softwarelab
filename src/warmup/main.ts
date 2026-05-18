@@ -48,6 +48,20 @@ const sun = new THREE.Mesh(sunGeometry, sunMaterial);
 sun.position.set(0, 0, 0);
 solarSystem.add(sun);
 
+//erde
+const earthGeometry = new THREE.SphereGeometry(0.5, 32, 32);
+const earthMaterial = new THREE.MeshStandardMaterial({ color: 0x2266ff });
+const earth = new THREE.Mesh(earthGeometry, earthMaterial);
+earth.position.set(5, 0, 0);
+solarSystem.add(earth);
+
+//mars
+const marsGeometry = new THREE.SphereGeometry(0.3, 32, 32);
+const marsMaterial = new THREE.MeshStandardMaterial({ color: 0xcc3300 });
+const mars = new THREE.Mesh(marsGeometry, marsMaterial);
+mars.position.set(8, 0, 2);
+solarSystem.add(mars);
+
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
