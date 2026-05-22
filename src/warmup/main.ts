@@ -1,8 +1,12 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import RotateComponent from "./RotateComponent";
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x050510);
+
+//rotation 
+const clock = new THREE.Clock();
 
 const camera = new THREE.PerspectiveCamera(
   75,                                      
@@ -31,6 +35,8 @@ directionalLight.shadow.camera.near = 0.5;
 directionalLight.shadow.camera.far = 50;
 scene.add(directionalLight);
 
+
+
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;   // Trägheit beim Bewegen
 controls.dampingFactor = 0.05;
@@ -40,6 +46,9 @@ controls.maxDistance = 50;
 //neues solar system
 const solarSystem = new THREE.Object3D();
 scene.add(solarSystem);
+
+const rotateComponent = new RotateComponent(solarSystem, new THREE.Vector3(0, 1, 0), 0.3);
+
 
 //sonne
 const sunGeometry = new THREE.SphereGeometry(1, 32, 32);
@@ -71,6 +80,10 @@ window.addEventListener('resize', () => {
 
 function animate(): void {
   requestAnimationFrame(animate);
+
+  const deltaTime = clock.getDelta();
+  rotateComponent.update(deltaTime);
+
   controls.update();
   renderer.render(scene, camera);
 }
