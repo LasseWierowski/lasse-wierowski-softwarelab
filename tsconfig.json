@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "types": ["vite/client", "vitest/globals"],
     "target": "es2023",
     "module": "esnext",
     "lib": ["ES2023", "DOM"],
