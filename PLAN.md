@@ -46,7 +46,7 @@ src/
     cameraSlice.ts         # NOT undoable: cameraPose (outside undo history)
     selectors.ts           # lastSphere, currentRayCount, etc.
   view3d/
-    Scene.ts               # Renderer, camera, grid, animation loop
+    Scene.ts               # Renderer, camera, grid, RAF loop
     RayRenderer.ts         # LineSegments — manages geometry lifecycle
     SphereRenderer.ts      # Mesh spheres + hover raycaster + tooltip
     CameraController.ts    # OrbitControls → dispatches updateCameraPose (throttled)
@@ -55,6 +55,7 @@ src/
   main.ts
   vite.config.ts           # Vitest config: jsdom environment + coverage thresholds
   __tests__/
+    setup.ts               # jsdom polyfills
     logic/
       rayIntersection.test.ts
       rmsError.test.ts
@@ -98,6 +99,8 @@ interface CameraState {
 
 Converting to Three.js at the boundary: `new THREE.Vector3(p.x, p.y, p.z)`. This happens only in `view3d/`, never in logic or state.
 
+**Known tradeoff — ray data duplication:** `spawnSphere` copies `currentRays` into the sphere payload. Those rays then live in both the sphere object and the redux-undo history snapshots of `currentRays`. For a lab tool with ≤20 spheres × ≤20 rays × ≤30 undo steps this is acceptable (~12 000 Point3D objects). If the undo history grows large, it will be visible in Redux DevTools as an oversized state tree.
+
 ---
 
 ## LSLS Algorithm (`src/logic/rayIntersection.ts`)
@@ -118,9 +121,14 @@ P = A⁻¹ · b
 
 Return `null` if:
 - N < 2 (not enough rays)
-- `Math.abs(mathjs.det(A)) < 1e-10` (singular — parallel or near-parallel rays)
+- `Math.abs(mathjs.det(A)) < SINGULAR_THRESHOLD` (parallel or near-parallel rays)
 
-The epsilon `1e-10` is relative to a unit-scale scene; document it as a named constant `SINGULAR_THRESHOLD`.
+```typescript
+// Chosen empirically for N ≤ 20 rays in a scene of ≤ 50 unit radius.
+// det(A) is dimensionless and bounded by ray count × angular spread.
+// Revisit if scene scale or ray count changes significantly.
+const SINGULAR_THRESHOLD = 1e-10;
+```
 
 ---
 
@@ -134,7 +142,7 @@ Undo/redo operates at the **action level** via redux-undo. The meaningful undo s
 - `clearRays` (undo = restore rays)
 - `deleteSphere` (undo = restore sphere)
 
-Pressing Ctrl+Z after 5 ray-adds will step back through them one at a time. This is acceptable for a lab tool. If it becomes annoying, `groupBy` in redux-undo can batch all `addRay` actions between two `spawnSphere` actions — leave this as a future enhancement.
+Pressing Ctrl+Z after 5 ray-adds steps back through them one at a time. Acceptable for a lab tool. If it becomes annoying, `groupBy` in redux-undo can batch all `addRay` actions between two `spawnSphere` actions — leave as a future enhancement.
 
 ### `sceneSlice` actions (all undoable)
 
@@ -148,14 +156,20 @@ Pressing Ctrl+Z after 5 ray-adds will step back through them one at a time. This
 `spawnSphere` receives an already-computed result — **the LSLS call happens in the event handler, not the reducer**:
 
 ```typescript
-// In the keydown handler (main.ts or CameraController)
+// In the keydown handler (main.ts)
 case 'c': {
   const { currentRays } = store.getState().scene.present;
-  if (currentRays.length < 2) return;
-  const position = computeClosestPoint(currentRays); // logic layer
-  if (!position) return; // parallel rays
+  if (currentRays.length < 2) {
+    uiPanel.showStatus('Need at least 2 rays');
+    return;
+  }
+  const position = computeClosestPoint(currentRays);
+  if (!position) {
+    uiPanel.showStatus('Rays are parallel — no unique intersection');
+    return;
+  }
   const rmsError = computeRmsError(position, currentRays);
-  dispatch(spawnSphere({ position, rays: currentRays, rmsError }));
+  dispatch(spawnSphere({ position, rays: [...currentRays], rmsError }));
   break;
 }
 ```
@@ -184,15 +198,17 @@ Undo/Redo: dispatch `ActionCreators.undo()` / `ActionCreators.redo()` targeting 
 | Input | Action |
 |-------|--------|
 | `R` | Read `camera.position` + forward vector, dispatch `addRay` |
-| `C` | Compute LSLS in handler → dispatch `spawnSphere` (or no-op) |
+| `C` | Compute LSLS in handler → dispatch `spawnSphere` (or show status message) |
 | `Shift+Click` on sphere | Dispatch `deleteSphere` (see click detection below) |
 | Undo button / `Ctrl+Z` | `ActionCreators.undo()` |
 | Redo button / `Ctrl+Y` | `ActionCreators.redo()` |
 | "New Ray Set" button | Dispatch `clearRays` |
 
+Keyboard events are bound to **`document`**, not the canvas. The canvas never needs `tabIndex`. Do not add `keydown` listeners to any `<input>` element — if inputs are ever added, guard with `e.target instanceof HTMLInputElement` check.
+
 ### Shift+Click vs. OrbitControls conflict
 
-OrbitControls consumes mouse events. A short drag must not trigger `deleteSphere`. Detection strategy:
+OrbitControls consumes mouse events. A short drag must not trigger `deleteSphere`. Strategy: record `mousedown` position, only treat `mouseup` as a click if delta < 4px.
 
 ```typescript
 let mouseDownPos = { x: 0, y: 0 };
@@ -203,12 +219,42 @@ canvas.addEventListener('mousedown', (e) => {
 
 canvas.addEventListener('mouseup', (e) => {
   if (!e.shiftKey) return;
-  const dx = e.clientX - mouseDownPos.x;
-  const dy = e.clientY - mouseDownPos.y;
-  if (Math.hypot(dx, dy) > 4) return; // was a drag, not a click
+  if (Math.hypot(e.clientX - mouseDownPos.x, e.clientY - mouseDownPos.y) > 4) return;
   // proceed with raycasting for deleteSphere
 });
 ```
+
+---
+
+## Rendering Architecture: RAF loop vs. Redux subscriptions
+
+These are two separate update paths and must not be conflated:
+
+| Path | Purpose | Trigger |
+|------|---------|---------|
+| `requestAnimationFrame` loop in `Scene.ts` | Calls `renderer.render(scene, camera)` every frame | Unconditional — required for smooth OrbitControls damping |
+| `store.subscribe()` in view classes | Updates Three.js geometry and DOM | Triggered by Redux dispatch |
+
+**`renderer.render()` runs unconditionally every frame.** Geometry updates (RayRenderer, SphereRenderer) and DOM updates (UIPanel) happen only in `store.subscribe()` callbacks.
+
+### Preventing redundant geometry rebuilds
+
+`store.subscribe()` fires on *every* dispatch, including `updateCameraPose` (every 200ms during orbit). Use reference equality to skip rebuilds when the scene slice did not change:
+
+```typescript
+// In main.ts, after store setup
+let prevScene: SceneState | null = null;
+
+store.subscribe(() => {
+  const scene = store.getState().scene.present;
+  if (scene === prevScene) return;
+  prevScene = scene;
+  rayRenderer.update(scene);
+  sphereRenderer.update(scene);
+});
+```
+
+`UIPanel` can apply the same guard keyed on the full state if needed.
 
 ---
 
@@ -220,11 +266,11 @@ canvas.addEventListener('mouseup', (e) => {
   - Current (not yet computed): green `#00ff88`
   - Archived (belonging to a sphere): grey `#888888`
 - Spheres: radius 0.15, red `#ff4444` `MeshStandardMaterial`
-- Hover tooltip: `Raycaster` on `mousemove`, tooltip `<div>` positioned via `Vector3.project(camera)` → NDC → pixel coords (multiply by `devicePixelRatio` for retina correctness)
+- Hover tooltip: `Raycaster` on `mousemove`, see tooltip spec below
 
 ### `RayRenderer` geometry lifecycle
 
-Every `addRay`, `spawnSphere`, `deleteSphere`, and undo/redo triggers a geometry rebuild. The class owns two `LineSegments` objects (current + archived). On each store update:
+The class owns two `LineSegments` objects (current + archived). On each `update()` call:
 
 ```typescript
 update(state: SceneState) {
@@ -238,45 +284,78 @@ update(state: SceneState) {
 }
 ```
 
-`buildGeometry` returns a new `BufferGeometry` with a `Float32Array` of segment endpoints.
+`buildGeometry` returns a new `BufferGeometry` with a `Float32Array` of segment endpoints. When there are zero rays, return a geometry with an empty positions array (not null) to avoid Three.js warnings.
 
-### `SphereRenderer` disposal
+### `SphereRenderer` lifecycle and diffing
 
-When `deleteSphere` fires, the corresponding `Mesh` must be explicitly disposed before removal:
+`SphereRenderer` owns a `Map<string, THREE.Mesh>` keyed by sphere id. On each `update()`:
 
 ```typescript
-removeSphere(id: string) {
-  const mesh = this.meshes.get(id);
-  if (!mesh) return;
-  mesh.geometry.dispose();
-  (mesh.material as THREE.Material).dispose();
-  this.scene.remove(mesh);
-  this.meshes.delete(id);
+update(state: SceneState) {
+  const incomingIds = new Set(state.spheres.map(s => s.id));
+
+  // Remove meshes no longer in state
+  for (const [id, mesh] of this.meshes) {
+    if (!incomingIds.has(id)) {
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+      this.scene.remove(mesh);
+      this.meshes.delete(id);
+    }
+  }
+
+  // Add meshes not yet in map
+  for (const sphere of state.spheres) {
+    if (!this.meshes.has(sphere.id)) {
+      const mesh = this.buildMesh(sphere);
+      this.scene.add(mesh);
+      this.meshes.set(sphere.id, mesh);
+    }
+  }
 }
 ```
 
-On full undo/redo replays, diff the incoming sphere list against `this.meshes` to determine which to add/remove.
+Sphere positions are immutable after creation — no position update path needed.
+
+### Tooltip positioning
+
+The tooltip is a `<div>` appended to `document.body` with `position: fixed`. It must not be inside the canvas container (which may have `overflow: hidden`). Conversion from 3D to screen coords:
+
+```typescript
+function toScreenPos(point: THREE.Vector3, camera: THREE.Camera, canvas: HTMLCanvasElement) {
+  const ndc = point.clone().project(camera);
+  return {
+    x: (ndc.x + 1) / 2 * canvas.clientWidth,
+    y: (1 - ndc.y) / 2 * canvas.clientHeight,
+  };
+}
+```
+
+Use `canvas.clientWidth/clientHeight` (CSS pixels), not `canvas.width/canvas.height` (device pixels). This is correct on retina displays without manual `devicePixelRatio` scaling.
 
 ---
 
 ## 2D UI Panel (`UIPanel.ts`)
 
-Subscribes to `store.subscribe()`. Reads state via selectors, updates `textContent` only (no innerHTML with dynamic data):
+Subscribes to `store.subscribe()`. Reads state via selectors, updates `textContent` only (no innerHTML with dynamic data).
+
+Exposes a `showStatus(msg: string)` method for transient messages (LSLS failure reasons). Status clears after 3 seconds via `setTimeout`.
 
 ```
-┌─────────────────────────────┐
-│ Current rays: 3              │
-│ Last sphere: (1.20, 0.50, 3.10) │
-│ RMS error: 0.042             │
-│ [Undo] [Redo] [New Ray Set] │
-└─────────────────────────────┘
+┌─────────────────────────────────────┐
+│ Current rays: 3                      │
+│ Last sphere: (1.20, 0.50, 3.10)     │
+│ RMS error: 0.042                     │
+│ [Undo] [Redo] [New Ray Set]         │
+│ Status: Need at least 2 rays        │
+└─────────────────────────────────────┘
 ```
 
 ---
 
 ## Camera Pose Persistence
 
-`CameraController.ts` listens to OrbitControls `change` events (fires at ~60fps during interaction). Dispatches `updateCameraPose` via a **hand-rolled throttle** (no lodash dependency):
+`CameraController.ts` listens to OrbitControls `change` events (~60fps during interaction). Dispatches `updateCameraPose` via a hand-rolled throttle (no lodash):
 
 ```typescript
 function throttle(fn: () => void, ms: number) {
@@ -285,7 +364,11 @@ function throttle(fn: () => void, ms: number) {
 }
 ```
 
-Throttle interval: 200ms. On app init, if Redux has a saved pose, apply it to the Three.js camera and `controls.target` before the first render.
+Throttle interval: 200ms.
+
+**Init:** On app start, read Redux camera state and apply it to the Three.js camera and `controls.target` before the first render. If Redux camera state is at its default values (e.g., position `{x:0, y:5, z:10}`, target `{x:0,y:0,z:0}`), apply those too — this is the canonical initial camera pose.
+
+**Reverse sync (Redux → Three.js):** If camera state is ever set from outside `CameraController` (e.g., a future "reset camera" feature), `CameraController` must pick it up. Wire this by checking in `store.subscribe()` whether `camera` state changed and, if so, applying it to `controls.object.position` and `controls.target`, then calling `controls.update()`.
 
 ---
 
@@ -307,14 +390,13 @@ export default defineConfig({
 });
 ```
 
-`setup.ts` must polyfill `crypto.randomUUID()` for jsdom:
+`setup.ts` polyfills `crypto.randomUUID()` for jsdom:
 
 ```typescript
 // src/__tests__/setup.ts
-import { vi } from 'vitest';
 if (!globalThis.crypto?.randomUUID) {
   Object.defineProperty(globalThis, 'crypto', {
-    value: { randomUUID: () => vi.fn()(() => Math.random().toString(36).slice(2)) },
+    value: { randomUUID: () => Math.random().toString(36).slice(2) },
   });
 }
 ```
@@ -338,20 +420,24 @@ if (!globalThis.crypto?.randomUUID) {
 ### `src/state/sceneSlice.test.ts`
 - `addRay` → appends to `currentRays`
 - `spawnSphere` → appends sphere with correct payload, clears `currentRays`
-- `spawnSphere` with < 2 rays → should not be dispatched (guard in handler, not reducer; test the handler guard separately)
 - `deleteSphere` → removes correct sphere by id, others unchanged
 - `clearRays` → empties `currentRays`, leaves spheres unchanged
 - Undo after `addRay` → `currentRays` reverts
 - Undo after `spawnSphere` → sphere removed, `currentRays` restored
 - Redo after undo → re-applies correctly
 
+### Handler guard (inline in `main.test.ts` or integration test)
+- C pressed with 0 rays → `spawnSphere` not dispatched, `uiPanel.showStatus` called
+- C pressed with 1 ray → same
+- C pressed with parallel rays → `computeClosestPoint` returns `null`, `spawnSphere` not dispatched
+
 ---
 
 ## Build / Run
 
 ```bash
-pnpm dev            # Vite dev server
-pnpm build          # tsc + vite build
-pnpm test           # vitest
+pnpm dev              # Vite dev server
+pnpm build            # tsc + vite build
+pnpm test             # vitest
 pnpm test --coverage  # vitest with coverage report
 ```
