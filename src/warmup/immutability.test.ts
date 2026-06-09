@@ -1,6 +1,7 @@
 import { produce } from 'immer';
 
-import { createSlice, configureStore, PayloadAction } from '@reduxjs/toolkit';
+import { createSlice, configureStore } from '@reduxjs/toolkit';
+import type { PayloadAction } from '@reduxjs/toolkit';
 
 interface Task {
   id: string;
@@ -65,7 +66,7 @@ describe('immutable updates', () => {
     expect(plainState.tasks[0].title).toBe('changed');
 
     const nextState = produce(initialState, draft => {
-        draft.tasks[0].status = 'in-progress';
+        draft.tasks[0].status = 'done';
     });
 
     expect(() => {
@@ -84,7 +85,7 @@ describe('immutable updates', () => {
     }
 
     const stateWithNewTask = produce(initialState, draft => {
-        draft.tasks[0].status = 'in-progress';
+        draft.tasks[0].status = 'done';
     });
 
     expect(hasChanged(initialState, stateWithNewTask, s => s.tasks)).toBe(true);
@@ -121,8 +122,8 @@ describe('immutable updates', () => {
     };
 
     const nextState = produce(bigState, draft => {
-        draft.tasks[500].status = 'in-progress';
-        draft.tasksById['task-500'].status = 'in-progress';
+        draft.tasks[500].status = 'done';
+        draft.tasksById['task-500'].status = 'done';
     });
 
     // beide Strukturen  neue Referenzen
@@ -183,7 +184,7 @@ describe('immutable updates', () => {
     );
 
     const stateWithChangedTask = produce(initialState, draft => {
-        draft.tasks[0].status = 'in-progress';
+        draft.tasks[0].status = 'done';
     });
     notify(stateWithChangedTask);
     expect(callCount).toBe(1);

@@ -139,7 +139,7 @@ function animate(): void {
   }
 
   frameCount++;
-  moonLogger.update(dt, frameCount);
+  moonLogger.update(frameCount);
 
   controls.update();
   renderer.render(scene, camera);

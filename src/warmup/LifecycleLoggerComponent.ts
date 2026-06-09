@@ -12,7 +12,7 @@ export class LifecycleLoggerComponent {
     log('Created', object.name || 'unnamed');
   }
 
-  update(deltaTime: number, frameCount: number): void {
+  update(frameCount: number): void {
     if (frameCount % 120 === 0) {
       log('Update tick', this.object.name || 'unnamed');
     }
