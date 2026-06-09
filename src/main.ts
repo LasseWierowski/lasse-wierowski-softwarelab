@@ -1,60 +1,87 @@
-import './style.css'
-import typescriptLogo from './assets/typescript.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import { setupCounter } from './counter.ts'
+import * as THREE from 'three';
+import { ActionCreators } from 'redux-undo';
+import { store } from './state/store';
+import { addRay, spawnSphere } from './state/sceneSlice';
+import type { SceneState } from './state/sceneSlice';
+import { computeClosestPoint } from './logic/rayIntersection';
+import { computeRmsError } from './logic/rmsError';
+import { Scene } from './view3d/Scene';
+import { RayRenderer } from './view3d/RayRenderer';
+import { SphereRenderer } from './view3d/SphereRenderer';
+import { CameraController } from './view3d/CameraController';
+import { UIPanel } from './view2d/UIPanel';
 
-document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-<section id="center">
-  <div class="hero">
-    <img src="${heroImg}" class="base" width="170" height="179">
-    <img src="${typescriptLogo}" class="framework" alt="TypeScript logo"/>
-    <img src="${viteLogo}" class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/main.ts</code> and save to test <code>HMR</code></p>
-  </div>
-  <button id="counter" type="button" class="counter"></button>
-</section>
+// Bootstrap canvas
+const appEl = document.querySelector<HTMLDivElement>('#app')!;
+appEl.innerHTML = '';
+const canvas = document.createElement('canvas');
+Object.assign(canvas.style, { display: 'block', width: '100vw', height: '100vh' });
+appEl.appendChild(canvas);
 
-<div class="ticks"></div>
+const threeScene = new Scene(canvas);
+const cameraCtrl = new CameraController(threeScene.camera, threeScene.renderer, store);
+const rayRenderer = new RayRenderer(threeScene.scene);
+const sphereRenderer = new SphereRenderer(
+  threeScene.scene, threeScene.camera, canvas, store.dispatch,
+);
+const uiPanel = new UIPanel(store, store.dispatch);
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#documentation-icon"></use></svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-    <ul>
-      <li>
-        <a href="https://vite.dev/" target="_blank">
-          <img class="logo" src="${viteLogo}" alt="" />
-          Explore Vite
-        </a>
-      </li>
-      <li>
-        <a href="https://www.typescriptlang.org" target="_blank">
-          <img class="button-icon" src="${typescriptLogo}" alt="">
-          Learn more
-        </a>
-      </li>
-    </ul>
-  </div>
-  <div id="social">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#social-icon"></use></svg>
-    <h2>Connect with us</h2>
-    <p>Join the Vite community</p>
-    <ul>
-      <li><a href="https://github.com/vitejs/vite" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#github-icon"></use></svg>GitHub</a></li>
-      <li><a href="https://chat.vite.dev/" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#discord-icon"></use></svg>Discord</a></li>
-      <li><a href="https://x.com/vite_js" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#x-icon"></use></svg>X.com</a></li>
-      <li><a href="https://bsky.app/profile/vite.dev" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#bluesky-icon"></use></svg>Bluesky</a></li>
-    </ul>
-  </div>
-</section>
+// Update geometry only when scene slice changes
+let prevScene: SceneState | null = null;
+store.subscribe(() => {
+  const scene = store.getState().scene.present;
+  if (scene === prevScene) return;
+  prevScene = scene;
+  rayRenderer.update(scene);
+  sphereRenderer.update(scene);
+});
 
-<div class="ticks"></div>
-<section id="spacer"></section>
-`
+// Initial geometry render
+rayRenderer.update(store.getState().scene.present);
+sphereRenderer.update(store.getState().scene.present);
 
-setupCounter(document.querySelector<HTMLButtonElement>('#counter')!)
+// Keyboard interactions — bound to document, never canvas
+document.addEventListener('keydown', (e: KeyboardEvent) => {
+  if (e.target instanceof HTMLInputElement) return;
+
+  switch (e.key.toLowerCase()) {
+    case 'r': {
+      const cam = threeScene.camera;
+      const forward = new THREE.Vector3();
+      cam.getWorldDirection(forward);
+      store.dispatch(addRay({
+        origin: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+        direction: { x: forward.x, y: forward.y, z: forward.z },
+      }));
+      break;
+    }
+    case 'c': {
+      const { currentRays } = store.getState().scene.present;
+      if (currentRays.length < 2) {
+        uiPanel.showStatus('Need at least 2 rays');
+        return;
+      }
+      const position = computeClosestPoint(currentRays);
+      if (!position) {
+        uiPanel.showStatus('Rays are parallel — no unique intersection');
+        return;
+      }
+      const rmsError = computeRmsError(position, currentRays);
+      store.dispatch(spawnSphere({ position, rays: [...currentRays], rmsError }));
+      break;
+    }
+    case 'z': {
+      if (e.ctrlKey || e.metaKey) store.dispatch(ActionCreators.undo());
+      break;
+    }
+    case 'y': {
+      if (e.ctrlKey || e.metaKey) store.dispatch(ActionCreators.redo());
+      break;
+    }
+  }
+});
+
+// Suppress unused variable warning — cameraCtrl update loop runs via OrbitControls internally
+void cameraCtrl;
+
+threeScene.start();
